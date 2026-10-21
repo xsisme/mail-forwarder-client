@@ -1,11 +1,12 @@
 """POP3, WeCom webhook, SMTP and staged diagnostics."""
 from __future__ import annotations
 
-from contextlib import contextmanager
+from contextlib import contextmanager, ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
 from email.message import EmailMessage
 from email.utils import formatdate, make_msgid
+import http.client
 import html
 import json
 import poplib
@@ -17,6 +18,8 @@ import urllib.error
 import urllib.request
 
 from .config import Config, SECRET_KEYS, split_list
+from .cancellation import (Cancelled, CancellableSocket, check_cancel,
+                            install_cancellable_io, watch_socket)
 from .parsing import Mail, truncate_utf8
 
 
@@ -28,15 +31,6 @@ class TransportError(RuntimeError):
     def __init__(self, stage: str, message: str):
         self.stage = stage
         super().__init__(message)
-
-
-class Cancelled(Exception):
-    pass
-
-
-def check_cancel(stop_event):
-    if stop_event is not None and stop_event.is_set():
-        raise Cancelled()
 
 
 @dataclass
@@ -108,40 +102,48 @@ def close_pop(connection, immediate=False):
 def pop_session(cfg: Config, emit=silent_emit, stop_event=None):
     connection = None
     stage = "network"
-    try:
-        check_cancel(stop_event)
-        emit("status", key="network", level="busy", text="正在连接邮箱…")
-        if cfg.pop_security == "SSL/TLS":
-            connection = poplib.POP3_SSL(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds,
-                                          context=pop_context(cfg))
-        else:
-            connection = poplib.POP3(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds)
-            if cfg.pop_security == "STARTTLS":
-                connection.stls(context=pop_context(cfg))
-        emit("status", key="network", level="ok", text="邮箱连接正常")
-        check_cancel(stop_event)
-        stage = "login"
-        emit("status", key="login", level="busy", text="正在验证账号…")
+    with ExitStack() as sockets:
         try:
-            connection.user(cfg.pop_user)
-            check_cancel(stop_event)
-            connection.pass_(cfg.pop_password)
-        except poplib.error_proto as exc:
-            raise TransportError("login", "POP3 登录被拒绝；请检查账号、密码及 POP3 权限。") from exc
-        emit("status", key="login", level="ok", text="账号登录成功")
-        stage = "mailbox"
-    except (TransportError, Cancelled):
-        raise
-    except Exception as exc:
-        raise TransportError(stage, safe_error(exc, cfg)) from exc
-    finally:
-        # Setup errors must release the socket even when login is rejected.
-        if stage != "mailbox":
+            try:
+                check_cancel(stop_event)
+                emit("status", key="network", level="busy", text="正在连接邮箱…")
+                if cfg.pop_security == "SSL/TLS":
+                    connection = poplib.POP3_SSL(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds,
+                                                context=pop_context(cfg))
+                else:
+                    connection = poplib.POP3(cfg.pop_host, cfg.pop_port, timeout=cfg.timeout_seconds)
+                sockets.enter_context(watch_socket(stop_event, connection.sock))
+                if cfg.pop_security == "STARTTLS":
+                    connection.stls(context=pop_context(cfg))
+                    sockets.enter_context(watch_socket(stop_event, connection.sock))
+                install_cancellable_io(connection, stop_event)
+                check_cancel(stop_event)
+                emit("status", key="network", level="ok", text="邮箱连接正常")
+                stage = "login"
+                emit("status", key="login", level="busy", text="正在验证账号…")
+                try:
+                    connection.user(cfg.pop_user)
+                    check_cancel(stop_event)
+                    connection.pass_(cfg.pop_password)
+                except poplib.error_proto as exc:
+                    check_cancel(stop_event)
+                    raise TransportError("login", "POP3 登录被拒绝；请检查账号、密码及 POP3 权限。") from exc
+                check_cancel(stop_event)
+                emit("status", key="login", level="ok", text="账号登录成功")
+                stage = "mailbox"
+            except (TransportError, Cancelled):
+                raise
+            except Exception as exc:
+                check_cancel(stop_event)
+                raise TransportError(stage, safe_error(exc, cfg)) from exc
+            try:
+                yield connection
+            except Exception:
+                check_cancel(stop_event)
+                raise
+        finally:
+            # Keep the socket registered through QUIT: some servers never reply.
             close_pop(connection, bool(stop_event is not None and stop_event.is_set()))
-    try:
-        yield connection
-    finally:
-        close_pop(connection, bool(stop_event is not None and stop_event.is_set()))
 
 
 def uidl_list(connection) -> list[tuple[int, str]]:
@@ -190,12 +192,47 @@ def wecom_payload(cfg: Config, mail: Mail) -> dict:
     return {"msgtype": "markdown", "markdown": {"content": truncate_utf8(content, 4000)}}
 
 
-def send_wecom(cfg: Config, mail: Mail) -> None:
+def open_webhook(request, timeout, stop_event):
+    context = ssl.create_default_context()
+    if stop_event is None:
+        return urllib.request.urlopen(request, timeout=timeout, context=context)
+
+    class HTTPConnection(http.client.HTTPConnection):
+        def connect(self):
+            super().connect()
+            self.sock = CancellableSocket(self.sock, stop_event)
+
+    class HTTPSConnection(http.client.HTTPSConnection):
+        def connect(self):
+            super().connect()
+            self.sock = CancellableSocket(self.sock, stop_event)
+
+    class HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):
+            return self.do_open(HTTPConnection, req)
+
+    class HTTPSHandler(urllib.request.HTTPSHandler):
+        def https_open(self, req):
+            return self.do_open(HTTPSConnection, req, context=context)
+
+    # Preserve urllib's proxy / redirect handling and certificate validation.
+    opener = urllib.request.build_opener(HTTPHandler(), HTTPSHandler(context=context))
+    check_cancel(stop_event)
+    return opener.open(request, timeout=timeout)
+
+
+def send_wecom(cfg: Config, mail: Mail, stop_event=None) -> None:
+    check_cancel(stop_event)
     data = json.dumps(wecom_payload(cfg, mail), ensure_ascii=False).encode("utf-8")
     request = urllib.request.Request(cfg.wecom_webhook, data=data,
                                      headers={"Content-Type": "application/json; charset=utf-8"}, method="POST")
-    with urllib.request.urlopen(request, timeout=cfg.timeout_seconds, context=ssl.create_default_context()) as response:
-        payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    try:
+        check_cancel(stop_event)
+        with open_webhook(request, cfg.timeout_seconds, stop_event) as response:
+            payload = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    except Exception:
+        check_cancel(stop_event)
+        raise
     if not isinstance(payload, dict) or payload.get("errcode") != 0:
         if isinstance(payload, dict):
             raise TransportError("wecom", f"企业微信返回错误 {payload.get('errcode')}：{payload.get('errmsg', '未知错误')}")
@@ -228,30 +265,45 @@ def message_id_domain(address: str) -> str:
 
 
 @contextmanager
-def smtp_session(cfg: Config):
+def smtp_session(cfg: Config, stop_event=None):
     connection = None
-    try:
-        context = ssl.create_default_context()
-        local_hostname = smtp_hello_name()
-        if cfg.smtp_security == "SSL/TLS":
-            connection = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port,
-                                           timeout=cfg.timeout_seconds, context=context,
-                                           local_hostname=local_hostname)
-        else:
-            connection = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds,
-                                      local_hostname=local_hostname)
-            connection.ehlo()
+    with ExitStack() as sockets:
+        try:
+            check_cancel(stop_event)
+            context = ssl.create_default_context()
+            local_hostname = smtp_hello_name()
+            check_cancel(stop_event)
+            if cfg.smtp_security == "SSL/TLS":
+                connection = smtplib.SMTP_SSL(cfg.smtp_host, cfg.smtp_port,
+                                              timeout=cfg.timeout_seconds, context=context,
+                                              local_hostname=local_hostname)
+            else:
+                connection = smtplib.SMTP(cfg.smtp_host, cfg.smtp_port, timeout=cfg.timeout_seconds,
+                                         local_hostname=local_hostname)
+            sockets.enter_context(watch_socket(stop_event, connection.sock))
             if cfg.smtp_security == "STARTTLS":
-                connection.starttls(context=context)
                 connection.ehlo()
-        connection.login(cfg.smtp_user, cfg.smtp_password)
-        yield connection
-    finally:
-        if connection:
-            try:
-                connection.quit()
-            except Exception:
-                connection.close()
+                check_cancel(stop_event)
+                connection.starttls(context=context)
+                sockets.enter_context(watch_socket(stop_event, connection.sock))
+            install_cancellable_io(connection, stop_event)
+            connection.ehlo()
+            check_cancel(stop_event)
+            connection.login(cfg.smtp_user, cfg.smtp_password)
+            check_cancel(stop_event)
+            yield connection
+        except Exception:
+            check_cancel(stop_event)
+            raise
+        finally:
+            if connection:
+                try:
+                    if stop_event is not None and stop_event.is_set():
+                        connection.close()
+                    else:
+                        connection.quit()
+                except Exception:
+                    connection.close()
 
 
 def build_forward(cfg: Config, mail: Mail) -> EmailMessage:
@@ -281,11 +333,13 @@ def build_forward(cfg: Config, mail: Mail) -> EmailMessage:
     return message
 
 
-def send_smtp(cfg: Config, mail: Mail) -> None:
+def send_smtp(cfg: Config, mail: Mail, stop_event=None) -> None:
+    check_cancel(stop_event)
     message = build_forward(cfg, mail)
     if len(message.as_bytes()) > 25 * 1024 * 1024:
         raise TransportError("smtp", "转发邮件编码后超过 25 MB；请使用企业微信通知或缩小原邮件附件。")
-    with smtp_session(cfg) as connection:
+    with smtp_session(cfg, stop_event) as connection:
+        check_cancel(stop_event)
         # A non-empty return value means partial recipient rejection, not full delivery.
         rejected = connection.send_message(message, to_addrs=cfg.recipients)
         if rejected:
@@ -309,9 +363,13 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
         emit("status", key="network", level="busy", text="正在检查 DNS / TCP…")
         try:
             socket.getaddrinfo(cfg.pop_host, cfg.pop_port, type=socket.SOCK_STREAM)
+            check_cancel(stop_event)
             with socket.create_connection((cfg.pop_host, cfg.pop_port), timeout=cfg.timeout_seconds):
                 pass
+        except Cancelled:
+            raise
         except Exception as exc:
+            check_cancel(stop_event)
             raise TransportError("network", safe_error(exc, cfg)) from exc
         emit("status", key="network", level="ok", text="DNS / TCP 可达")
         check_cancel(stop_event)
@@ -319,16 +377,21 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
             count, _ = connection.stat()
             check_cancel(stop_event)
             uids = uidl_list(connection)
+            check_cancel(stop_event)
             emit("status", key="mailbox", level="ok", text=f"{count} 封邮件 · UIDL 正常")
             if len(uids) != count:
                 emit("log", level="WARNING", text="服务器 STAT 与 UIDL 数量不一致，转发以 UIDL 列表为准。")
         emit("log", level="INFO", text="公司邮箱登录及邮件列表读取成功。")
         result.mailbox_ok = True
+        check_cancel(stop_event)
     except Cancelled:
         result.cancelled = True
         emit("log", level="INFO", text="检测已取消。")
         return result
     except Exception as exc:
+        if stop_event is not None and stop_event.is_set():
+            result.cancelled = True
+            return result
         key = exc.stage if isinstance(exc, TransportError) else "mailbox"
         emit("status", key=key, level="error", text=safe_error(exc, cfg))
         emit("log", level="ERROR", text="邮箱检测失败：" + safe_error(exc, cfg))
@@ -345,13 +408,18 @@ def diagnose(cfg: Config, emit=silent_emit, mailbox_only: bool = False, stop_eve
         result.channels[channel] = False
         emit("status", key=channel, level="busy", text="正在发送测试通知…")
         try:
-            sender(cfg, test_mail())
+            sender(cfg, test_mail(), stop_event=stop_event)
             result.channels[channel] = True
             text = "接口已接受测试消息" if channel == "wecom" else "SMTP 已接受测试邮件"
             emit("status", key=channel, level="ok", text=text)
             emit("log", level="INFO", text=text + "；请在对应通道确认收到。")
         except Exception as exc:
+            if isinstance(exc, Cancelled) or (stop_event is not None and stop_event.is_set()):
+                result.cancelled = True
+                return result
             text = safe_error(exc, cfg)
             emit("status", key=channel, level="error", text=text)
             emit("log", level="ERROR", text=f"{'企业微信' if channel == 'wecom' else 'SMTP'}通道检测失败：{text}")
+    if stop_event is not None and stop_event.is_set():
+        result.cancelled = True
     return result

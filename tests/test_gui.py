@@ -36,7 +36,7 @@ class GuiTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def set_valid_config(self):
-        for key, value in {"pop_user": "user@example.test", "pop_password": "fake-password",
+        for key, value in {"pop_host": "pop.example.test", "pop_user": "user@example.test", "pop_password": "fake-password",
                            "wecom_webhook": "https://example.test/send?key=NOT-REAL"}.items():
             self.window.vars[key].set(value)
 
@@ -82,11 +82,36 @@ class GuiTests(unittest.TestCase):
 
     def test_saving_and_loading_accounts_without_remembering_password(self):
         self.set_valid_config()
+        self.window.vars["excluded_senders"].set("blocked@example.test;news@example.test")
         self.window.save()
         loaded, warning = ConfigStore(Path(self.tmp.name)).load()
         self.assertEqual(loaded.pop_user, "user@example.test")
         self.assertEqual(loaded.pop_password, "")
+        self.assertEqual(loaded.excluded_sender_addresses, {"blocked@example.test", "news@example.test"})
         self.assertFalse(warning)
+
+    def test_invalid_exclusion_does_not_replace_saved_settings(self):
+        self.set_valid_config()
+        self.window.save()
+        previous = self.window.store.path.read_bytes()
+        self.window.vars["excluded_senders"].set("*@example.test")
+        with patch("mailclient.gui.messagebox.showerror") as error:
+            self.window.save()
+        error.assert_called_once()
+        self.assertEqual(self.window.store.path.read_bytes(), previous)
+
+    def test_policy_exclusion_field_can_scroll_into_view(self):
+        self.root.deiconify()
+        self.root.geometry("1000x730")
+        self.window.notebook.select(2)
+        self.root.update()
+        tab = self.window.tabs[2]
+        tab.canvas.yview_moveto(1)
+        self.root.update()
+        entry = self.window.inputs["excluded_senders"]
+        self.assertGreaterEqual(entry.winfo_rooty(), tab.canvas.winfo_rooty())
+        self.assertLessEqual(entry.winfo_rooty() + entry.winfo_height(),
+                             tab.canvas.winfo_rooty() + tab.canvas.winfo_height())
 
     def test_worker_events_are_queued_and_password_is_redacted(self):
         self.window.active_config.pop_password = "fake-secret-value"

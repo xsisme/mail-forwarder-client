@@ -17,6 +17,7 @@ import customtkinter as ctk
 
 from . import __version__
 from .config import Config, ConfigError, ConfigStore
+from .cancellation import CancellationEvent
 from .engine import Forwarder
 from .transports import diagnose, safe_error
 from .ios_layout import IOSLayout
@@ -24,6 +25,8 @@ from .ios_widgets import COLORS
 
 
 class ClientWindow(IOSLayout):
+    CLOSE_GRACE_SECONDS = 2.0
+
     def __init__(self, root: tk.Tk, folder: Path):
         self.root, self.folder = root, folder
         self.folder.mkdir(parents=True, exist_ok=True)
@@ -36,9 +39,10 @@ class ClientWindow(IOSLayout):
         self.active_config = cfg
         self.checked_config = None
         self.events = queue.Queue()
-        self.stop_event = threading.Event()
+        self.stop_event = CancellationEvent()
         self.worker = None
         self.closing = False
+        self.closed = False
         self.controls = []
         self.status_vars = {}
         self.status_labels = {}
@@ -88,7 +92,9 @@ class ClientWindow(IOSLayout):
             elif isinstance(value, str) and field.name not in ("pop_password", "smtp_password"):
                 value = value.strip()
             values[field.name] = value
-        return Config(**values)
+        cfg = Config(**values)
+        cfg.validate_excluded_senders()
+        return cfg
 
     def save(self):
         try:
@@ -102,7 +108,7 @@ class ClientWindow(IOSLayout):
             messagebox.showerror("保存失败", safe_error(exc, self.active_config), parent=self.root)
 
     def launch(self, mode: str):
-        if self.worker and self.worker.is_alive():
+        if self.closing or (self.worker and self.worker.is_alive()):
             return
         try:
             cfg = self.collect()
@@ -165,10 +171,12 @@ class ClientWindow(IOSLayout):
     def stop(self):
         self.stop_event.set()
         self.stop_button.configure(state="disabled")
-        self.phase_var.set("正在停止 · 等待当前网络操作结束…")
+        self.phase_var.set("正在停止 · 正在取消网络操作…")
 
     def post(self, kind: str, **data):
         # Only queue/log from workers. No Tk call is allowed in this method.
+        if self.closed:
+            return
         if kind == "log":
             text = safe_error(RuntimeError(str(data.get("text", ""))), self.active_config)
             data["text"] = text
@@ -190,6 +198,8 @@ class ClientWindow(IOSLayout):
         self.check_time_var.set("最近检查  " + self.last_check)
 
     def _drain(self):
+        if self.closed:
+            return
         for _ in range(300):
             try:
                 event = self.events.get_nowait()
@@ -215,20 +225,18 @@ class ClientWindow(IOSLayout):
                 self.last_check = event["time"]
                 self._update_stats()
             elif kind == "phase":
-                self.phase_var.set(event["text"])
+                if not self.closing:
+                    self.phase_var.set(event["text"])
             elif kind == "diagnosed":
                 self.checked_config = event["config"]
             elif kind == "finished":
                 # A finished event can arrive just before Thread.is_alive() flips.
                 self.root.after(50, self._finish_when_stopped)
-        if not self.closing:
-            self.root.after(100, self._drain)
-        elif self.worker and self.worker.is_alive():
-            self.root.after(100, self._drain)
-        else:
-            self._destroy_root()
+        self.root.after(100, self._drain)
 
     def _finish_when_stopped(self):
+        if self.closing or self.closed:
+            return
         if self.worker and self.worker.is_alive():
             self.root.after(50, self._finish_when_stopped)
         elif not self.closing:
@@ -249,19 +257,37 @@ class ClientWindow(IOSLayout):
         if self.closing:
             return
         self.closing = True
+        self.close_deadline = time.monotonic() + self.CLOSE_GRACE_SECONDS
+        self.stop_event.set()
         if self.worker and self.worker.is_alive():
-            self.stop()
             self.set_busy(True)
+            self.stop_button.configure(state="disabled")
+            self.phase_var.set("正在关闭 · 正在取消网络操作…")
+            self.root.after(50, self._close_when_stopped)
         else:
             self._destroy_root()
 
+    def _close_when_stopped(self):
+        # DNS, connection setup and TLS handshakes may still be in OS calls.
+        # Never wait indefinitely in Tk; the worker is a daemon and checks
+        # cancellation before starting each subsequent network operation.
+        if self.closed:
+            return
+        if not self.worker.is_alive() or time.monotonic() >= self.close_deadline:
+            self._destroy_root()
+        else:
+            self.root.after(50, self._close_when_stopped)
+
     def _destroy_root(self):
+        if self.closed:
+            return
         # CTk's Windows mainloop first runs a nested Tk update to paint the
         # titlebar. A close event there must not destroy the root while that
         # initialization still needs to query it.
         if not getattr(self.root, "_window_exists", True):
             self.root.after(50, self._destroy_root)
             return
+        self.closed = True
         # Destroying Tk deletes Python callback commands. Cancel their timers
         # first so already pending callbacks cannot run against a dead window.
         for timer in self.root.tk.call("after", "info"):
@@ -269,8 +295,10 @@ class ClientWindow(IOSLayout):
         self.root.destroy()
 
     def shutdown(self):
-        self.handler.close()
+        self.closed = True
+        self.stop_event.set()
         self.logger.removeHandler(self.handler)
+        self.handler.close()
 
 
 def main(argv=None) -> int:

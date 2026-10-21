@@ -8,7 +8,8 @@ import threading
 import time
 
 from .config import Config, split_list
-from .parsing import matches_keywords, parse_mail
+from .cancellation import check_cancel
+from .parsing import is_excluded_sender, matches_keywords, parse_mail
 from .state import StateStore
 from .transports import (Cancelled, TransportError, pop_session, safe_error, send_smtp,
                          send_wecom, silent_emit, uidl_list)
@@ -24,12 +25,14 @@ class Forwarder:
             return
         with pop_session(self.cfg, self.emit, self.stop) as connection:
             items = uidl_list(connection)
+            check_cancel(self.stop)
             self.emit("status", key="mailbox", level="ok", text=f"{len(items)} 封邮件 · UIDL 正常")
             if not state.initialized:
                 state.initialize([uid for _, uid in items], self.cfg.test_latest_first_run)
                 self.emit("log", level="INFO", text=f"已建立 {len(items)} 封历史邮件的基线；"
-                          + ("最后一封进入测试流程，仍按关键词过滤。" if self.cfg.test_latest_first_run and items else "历史邮件不转发。"))
+                          + ("最后一封进入测试流程，仍按排除名单和关键词过滤。" if self.cfg.test_latest_first_run and items else "历史邮件不转发。"))
             known = state.records()
+            excluded = self.cfg.excluded_sender_addresses
             for number, uid in items:
                 if self.stop.is_set():
                     break
@@ -42,14 +45,23 @@ class Forwarder:
                 try:
                     _, lines, _ = connection.retr(number)
                 except Exception as exc:
+                    check_cancel(self.stop)
                     raise TransportError("mailbox", "邮件读取失败：" + safe_error(exc, self.cfg)) from exc
+                check_cancel(self.stop)
                 try:
                     mail = parse_mail(b"\r\n".join(lines))
                 except Exception as exc:
                     self.emit("log", level="ERROR", text=f"邮件解析失败，后续邮件继续处理：{safe_error(exc, self.cfg)}")
                     self.emit("counter", key="failed", amount=1)
                     continue
-                # A partially delivered message must retain its pending route even if filters change.
+                check_cancel(self.stop)
+                # Sender exclusions also cancel any pending route on a partial delivery.
+                if is_excluded_sender(mail, excluded):
+                    state.ignore(uid)
+                    self.emit("counter", key="filtered", amount=1)
+                    self.emit("log", level="INFO", text="已跳过排除发件人的邮件，两个通道均不再投递。")
+                    continue
+                # Keyword changes alone do not cancel a partially delivered message.
                 already_delivered = bool(record and (record[0] or record[1]))
                 if not already_delivered and not matches_keywords(mail, split_list(self.cfg.keywords)):
                     state.ignore(uid)
@@ -72,8 +84,11 @@ class Forwarder:
                             break
                         self.last_wecom = time.monotonic()
                     try:
-                        sender(self.cfg, mail)
+                        sender(self.cfg, mail, stop_event=self.stop)
+                    except Cancelled:
+                        raise
                     except Exception as exc:
+                        check_cancel(self.stop)
                         text = safe_error(exc, self.cfg)
                         self.emit("status", key=channel, level="error", text="投递失败，下轮重试")
                         self.emit("counter", key="failed", amount=1)
@@ -99,6 +114,8 @@ class Forwarder:
                 except Cancelled:
                     break
                 except Exception as exc:
+                    if self.stop.is_set():
+                        break
                     key = exc.stage if isinstance(exc, TransportError) else "mailbox"
                     self.emit("status", key=key, level="error", text=safe_error(exc, self.cfg))
                     if key == "network":
