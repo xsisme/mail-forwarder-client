@@ -27,6 +27,7 @@ class Mail:
     code: str | None = None
     attachments: list[Attachment] = field(default_factory=list)
     omitted: list[str] = field(default_factory=list)
+    sender_addresses: tuple[str, ...] = ()
 
 
 def decode_header_text(value) -> str:
@@ -72,8 +73,14 @@ def extract_code(subject: str, body: str) -> str | None:
 
 def parse_mail(raw: bytes) -> Mail:
     message = email.message_from_bytes(raw, policy=policy.default)
+    # Parse the structured From header, not its decoded display name or body.
+    addresses = tuple(dict.fromkeys(
+        address.addr_spec.casefold()
+        for header in message.get_all("From", [])
+        for address in header.addresses if address.username and address.domain))
     mail = Mail(subject=decode_header_text(message.get("Subject")) or "(无主题)",
-                sender=decode_header_text(message.get("From")), date=decode_header_text(message.get("Date")))
+                sender=decode_header_text(message.get("From")), date=decode_header_text(message.get("Date")),
+                sender_addresses=addresses)
     plain, rich = [], []
     attachment_total = 0
 
@@ -117,6 +124,10 @@ def parse_mail(raw: bytes) -> Mail:
 def matches_keywords(mail: Mail, keywords: list[str]) -> bool:
     text = (mail.subject + "\n" + mail.plain).casefold()
     return not keywords or any(word.casefold() in text for word in keywords)
+
+
+def is_excluded_sender(mail: Mail, addresses: set[str]) -> bool:
+    return bool(addresses.intersection(mail.sender_addresses))
 
 
 def truncate_utf8(value: str, limit: int) -> str:

@@ -270,10 +270,15 @@ class IOSLayout:
         self._entry(rules, 0, "检查间隔 / 秒", "poll_seconds")
         self._entry(rules, 1, "连接超时 / 秒", "timeout_seconds")
         self._entry(rules, 2, "过滤关键词", "keywords")
-        self.label(rules, "多个关键词用逗号分隔；留空将转发全部新邮件。", 11, MUTED,
+        self.label(rules, "多个关键词用逗号分隔；留空则只按发件人排除名单过滤。", 11, MUTED,
                    wraplength=550).grid(row=3, column=0, sticky="w", pady=(8, 4))
-        self.switch(rules, 4, "首次测试最后一封邮件", "test_latest_first_run", "仍按关键词过滤；之后重启不重复转发历史邮件")
-        self.note(policy, "邮件记录按账号保存，两个通道分别重试；本客户端不会删除原邮箱邮件。", 1)
+        self.switch(rules, 4, "首次测试最后一封邮件", "test_latest_first_run", "仍按排除名单和关键词过滤；重启不重复转发历史邮件")
+        _, _, exclusions = self.card(policy, 1, "发件人排除名单", "这些邮箱的来信不转发到任何通道", "sliders")
+        self._entry(exclusions, 0, "排除发件邮箱", "excluded_senders")
+        self.label(exclusions, "填写完整邮箱，多个用逗号或分号分隔；留空不排除。忽略大小写，只匹配发件地址。\n"
+                   "优先于关键词和首次测试，也会停止名单中邮件的失败重试。移除后仅处理后续新邮件。", 11, MUTED,
+                   wraplength=550, justify="left").grid(row=1, column=0, sticky="w", pady=(8, 4))
+        self.note(policy, "修改规则前请先停止转发，保存后重新开始；原邮箱邮件不会被删除。", 2)
 
         _, _, log_body = self.card(logs, 0, "实时运行记录", "查看连接、登录、通道检测和邮件投递结果", "log")
         log_body.rowconfigure(0, weight=1)
