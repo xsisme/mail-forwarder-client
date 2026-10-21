@@ -56,6 +56,7 @@ class Config:
     timeout_seconds: int = 20
     test_latest_first_run: bool = True
     keywords: str = "验证码,校验码,动态码,口令,code,verification,OTP"
+    excluded_senders: str = ""
     remember_credentials: bool = sys.platform == "win32"
 
     @property
@@ -75,7 +76,17 @@ class Config:
     def wecom_mentioned_userids(self) -> list[str]:
         return list(dict.fromkeys(item.removeprefix("@") for item in split_list(self.wecom_userids)))
 
+    @property
+    def excluded_sender_addresses(self) -> set[str]:
+        return {address.casefold() for address in split_list(self.excluded_senders)}
+
+    def validate_excluded_senders(self) -> None:
+        for address in split_list(self.excluded_senders):
+            if not re.fullmatch(r"[^\s@,;<>\"()\\*]+@[^\s@,;<>\"()\\*]+\.[^\s@,;<>\"()\\*]+", address):
+                raise ConfigError("排除发件人请填写完整邮箱地址，用逗号分隔；不要填显示姓名、域名或通配符。")
+
     def validate(self, require_channels: bool = True) -> None:
+        self.validate_excluded_senders()
         if not self.pop_host.strip() or not self.pop_user.strip() or not self.pop_password:
             raise ConfigError("请填写公司 POP3 服务器、邮箱账号和密码。")
         if any(c in self.pop_host for c in "/\\ \t\r\n") or self.pop_host != self.pop_host.strip():

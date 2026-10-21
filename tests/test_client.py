@@ -438,9 +438,9 @@ class EngineTests(unittest.TestCase):
         pop = FakePop([("one", raw_mail("第一封")), ("two", raw_mail("第二封"))])
         calls = {"wecom": [], "smtp": []}
         failed_once = set()
-        def wecom(cfg, mail):
+        def wecom(cfg, mail, stop_event=None):
             calls["wecom"].append(mail.subject)
-        def smtp(cfg, mail):
+        def smtp(cfg, mail, stop_event=None):
             calls["smtp"].append(mail.subject)
             if mail.subject == "第一封" and not failed_once:
                 failed_once.add(True)
@@ -466,7 +466,7 @@ class EngineTests(unittest.TestCase):
         pop.messages.append(("new", raw_mail("真正的新邮件")))
         subjects = []
         with patch("mailclient.engine.pop_session", self.session(pop)), \
-             patch("mailclient.engine.send_smtp", side_effect=lambda cfg, mail: subjects.append(mail.subject)):
+             patch("mailclient.engine.send_smtp", side_effect=lambda cfg, mail, **kw: subjects.append(mail.subject)):
             self.forwarder.poll_once(self.state)
         self.assertEqual(subjects, ["测试", "真正的新邮件"])
 
@@ -486,6 +486,20 @@ class EngineTests(unittest.TestCase):
         with patch("mailclient.engine.pop_session") as connect:
             self.forwarder.poll_once(self.state)
         connect.assert_not_called()
+
+    def test_stop_after_success_still_checkpoints_and_does_not_start_next_route(self):
+        self.state.initialize([], False)
+        pop = FakePop([("one", raw_mail())])
+
+        def accepted(cfg, mail, stop_event=None):
+            stop_event.set()
+
+        with patch("mailclient.engine.pop_session", self.session(pop)), \
+             patch("mailclient.engine.send_wecom", side_effect=accepted), \
+             patch("mailclient.engine.send_smtp") as smtp:
+            self.forwarder.poll_once(self.state)
+        self.assertEqual(self.state.records()["one"], (True, False, False))
+        smtp.assert_not_called()
 
 
 if __name__ == "__main__":
