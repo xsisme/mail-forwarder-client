@@ -1,0 +1,3 @@
+# Native desktop UI. Mail transports and persistence use the standard library.
+customtkinter==5.2.2
+Pillow>=10,<12
